@@ -127,7 +127,7 @@ struct STF {
         return STF<T>();
     }
 
-    static auto ready(T val) 
+    static auto pure(T val) 
     {
         auto out = empty();
         out.fulfill(std::move(val));
@@ -155,12 +155,11 @@ struct STF {
     template <typename F>
     auto then_impl(F f, auto future) 
     {
-        auto task = [=] (T& val) { return f(val); };
         add_trigger([=] (T& val) mutable
             {
                 scheduler.tasks.push([=] () mutable
                     {
-                        future.fulfill(task(val));   
+                        future.fulfill(f(val));   
                     }
                 );
             }
@@ -172,7 +171,7 @@ template <typename F, typename T>
 auto fmap(F f, STF<T> val)
 {
     auto f_curried = curry(f);
-    auto out = STF<decltype(f_curried(std::declval<T>()))>::empty();
+    auto out = STF<std::result_of_t<decltype(f_curried)(T)>>::empty();
     val.then_impl(f_curried, out);
     return out;
 }
@@ -180,7 +179,7 @@ auto fmap(F f, STF<T> val)
 template <typename F, typename T>
 auto ap(STF<F> f_fut, STF<T> val_fut)
 {
-    auto out = STF<decltype(std::declval<F>()(std::declval<T>()))>::empty();
+    auto out = STF<std::result_of_t<F(T)>>::empty();
     f_fut.add_trigger([=] (F& f) mutable
         {
             val_fut.then_impl(f, out);
@@ -189,17 +188,42 @@ auto ap(STF<F> f_fut, STF<T> val_fut)
     return out;
 }
 
+template <typename T>
+auto unwrap(STF<STF<T>> in)
+{
+    auto out = STF<T>::empty();
+    in.add_trigger([=] (STF<T>& inner) mutable
+        {
+            inner.add_trigger([=] (T& val) mutable
+                {
+                    out.fulfill(val);
+                }
+            );
+        }
+    );
+    return out;
+}
+
+template <typename F, typename T>
+auto bind(F f, STF<T> val_fut)
+{
+    auto out = STF<std::result_of_t<F(T)>>::empty();
+    val_fut.then_impl(f, out);
+    return unwrap(out);
+}
+
 
 int main() {
-    auto print = [] (auto v) { std::cout << v << std::endl; return 0; };
+    auto print = [] (int v) { std::cout << v << std::endl; return 0; };
     auto mult = [] (int x, int y) { return x * y; };
     auto fut = async([] () { std::cout << "HI" << std::endl; return 11; });
-    fmap(std::function<int(int)>(print), fut);
-    fmap(std::function<int(int)>(print), ap(fmap(mult, fut), STF<int>::ready(10)));
+    fmap(print, fut);
+    // print <$> (mult <$> fut <*> STF 10)
+    fmap(print, ap(fmap(mult, fut), STF<int>::pure(10)));
+    auto react = [] (int x) { if (x < 5) { return STF<int>::pure(x); } else { return async([]() {return 20;}); } };
+    auto bound = bind(react, fut);
+    fmap(print, bound);
 
-    // fut.then();
-    // fut.then([] (int abc) { return bind([] (int x, int y) {return x * y;}, abc); })
-    //    .then([] (auto in) { std::cout << in(50) << std::endl; return 0; });
     scheduler.run();
     return 0;
 }

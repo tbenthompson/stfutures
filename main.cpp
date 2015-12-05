@@ -4,6 +4,85 @@
 #include <functional>
 #include <memory>
 
+
+// This curry code is based off the implementation here:
+// https://stackoverflow.com/questions/152005/how-can-currying-be-done-in-c/26768388#26768388
+template <typename F> struct Curry;
+
+// specialization for functions with a single argument
+template <typename Return, typename Arg> 
+struct Curry<std::function<Return(Arg)>> {
+    using Type = std::function<Return(Arg)>;
+    const Type result;
+    Curry(Type fun): result(fun) {}
+};
+
+template <typename Return, typename Arg1, typename... Args>
+struct Curry<std::function<Return(Arg1,Args...)>> {
+    using Remaining = typename Curry<std::function<Return(Args...)>>::Type;
+    using Type = std::function<Remaining(Arg1)>;
+    const Type result;
+    Curry(std::function<Return(Arg1,Args...)> fun): 
+        result([=](const Arg1& t) {
+                return Curry<std::function<Return(Args...)>>(
+                    [=](const Args&... args){ 
+                        return fun(t, args...); 
+                    }
+                ).result;
+            }
+        )
+    {}
+};
+
+template <typename Return, typename... Args> 
+auto curry(const std::function<Return(Args...)>& f)
+{
+    return Curry<std::function<Return(Args...)>>(f).result;
+}
+
+template <typename Return, typename... Args> 
+auto curry(Return(*f)(Args...))
+{
+    return Curry<std::function<Return(Args...)>>(f).result;
+}
+
+template<typename T> struct remove_class { };
+template<typename C, typename R, typename... A>
+struct remove_class<R(C::*)(A...)> { using type = R(A...); };
+template<typename C, typename R, typename... A>
+struct remove_class<R(C::*)(A...) const> { using type = R(A...); };
+template<typename C, typename R, typename... A>
+struct remove_class<R(C::*)(A...) volatile> { using type = R(A...); };
+template<typename C, typename R, typename... A>
+struct remove_class<R(C::*)(A...) const volatile> { using type = R(A...); };
+
+template<typename T>
+struct get_signature_impl { using type = typename remove_class<
+    decltype(&std::remove_reference<T>::type::operator())>::type; };
+template<typename R, typename... A>
+struct get_signature_impl<R(A...)> { using type = R(A...); };
+template<typename R, typename... A>
+struct get_signature_impl<R(&)(A...)> { using type = R(A...); };
+template<typename R, typename... A>
+struct get_signature_impl<R(*)(A...)> { using type = R(A...); };
+template<typename T> using get_signature = typename get_signature_impl<T>::type;
+
+template<typename F> using make_function_type = std::function<get_signature<F>>;
+template<typename F> make_function_type<F> make_function(F &&f) {
+    return make_function_type<F>(std::forward<F>(f)); }
+
+template <typename F>
+auto curry(F f)
+{
+    return curry(make_function(f));
+}
+
+// CURRYING!
+//https://stackoverflow.com/questions/152005/how-can-currying-be-done-in-c/26768388#26768388
+//https://gist.github.com/ivan-cukic/6269914
+//https://www.reddit.com/r/cpp/comments/1kkkne/currying_in_c11/
+//https://github.com/LeszekSwirski/cpp-curry
+
 struct Scheduler {
     std::queue<std::function<void()>> tasks;
     void run();
@@ -22,17 +101,37 @@ thread_local Scheduler scheduler;
 template <typename T>
 struct STFData {
     std::unique_ptr<T> val;
-    int dependencies;
     std::vector<std::function<void(T& val)>> fulfill_triggers;
 };
 
 template <typename T>
+struct STF;
+
+template <typename F>
+static auto async(F f)
+{
+    auto out = STF<typename std::result_of_t<F()>>::empty();
+    scheduler.tasks.push([=] () mutable { out.fulfill(f()); });
+    return out;
+}
+
+template <typename T>
 struct STF {
+    using Type = T;
     std::shared_ptr<STFData<T>> data;
 
-    STF(): data(std::make_shared<STFData<T>>()) 
+    STF(): data(std::make_shared<STFData<T>>()) {}
+
+    static auto empty() 
     {
-        data->dependencies = 0;
+        return STF<T>();
+    }
+
+    static auto ready(T val) 
+    {
+        auto out = empty();
+        out.fulfill(std::move(val));
+        return out;
     }
     
     void fulfill(T val) 
@@ -43,50 +142,64 @@ struct STF {
             t(*data->val);
         }
     }
+
+    void add_trigger(std::function<void(T& val)> trigger)
+    {
+        if (data->val != nullptr) {
+            trigger(*data->val);
+        } else {
+            data->fulfill_triggers.push_back(trigger);
+        }
+    }
+
+    template <typename F>
+    auto then_impl(F f, auto future) 
+    {
+        auto task = [=] (T& val) { return f(val); };
+        add_trigger([=] (T& val) mutable
+            {
+                scheduler.tasks.push([=] () mutable
+                    {
+                        future.fulfill(task(val));   
+                    }
+                );
+            }
+        );
+    }
 };
 
-template <typename T>
-STF<T> empty() 
+template <typename F, typename T>
+auto fmap(F f, STF<T> val)
 {
-    return STF<T>();
-}
-
-template <typename T>
-STF<T> ready(T val) 
-{
-    auto out = empty<T>();
-    out.fulfill(std::move(val));
+    auto f_curried = curry(f);
+    auto out = STF<decltype(f_curried(std::declval<T>()))>::empty();
+    val.then_impl(f_curried, out);
     return out;
 }
 
-template <typename F, typename... Args>
-STF<typename std::result_of<F(Args&...)>::type> 
-after(F f, STF<Args>... args) 
+template <typename F, typename T>
+auto ap(STF<F> f_fut, STF<T> val_fut)
 {
-    typedef typename std::result_of<F(Args&...)>::type OutType;
-    auto out = empty<OutType>();
-    out->data.dependencies = sizeof...(args);
-    args->data.fulfill_triggers.push_back(
-        [=] (Args& val) 
+    auto out = STF<decltype(std::declval<F>()(std::declval<T>()))>::empty();
+    f_fut.add_trigger([=] (F& f) mutable
         {
-            (void)val;
+            val_fut.then_impl(f, out);
         }
-    )...;
-    // attach a handler to each dependency that triggers a countdown on the dependent. when that countdown is done,
-    // add the task to the queue
-}
-
-template <typename F>
-STF<typename std::result_of<F()>::type> async(F f)
-{
-    STF<typename std::result_of<F()>::type> out;
-    scheduler.tasks.push([=] () mutable { out.fulfill(f()); });
+    );
     return out;
 }
+
 
 int main() {
+    auto print = [] (auto v) { std::cout << v << std::endl; return 0; };
+    auto mult = [] (int x, int y) { return x * y; };
     auto fut = async([] () { std::cout << "HI" << std::endl; return 11; });
-    fut = after([] (int a) { std::cout << "WHAAA" << std::endl; return a + 1; }, fut);
+    fmap(std::function<int(int)>(print), fut);
+    fmap(std::function<int(int)>(print), ap(fmap(mult, fut), STF<int>::ready(10)));
+
+    // fut.then();
+    // fut.then([] (int abc) { return bind([] (int x, int y) {return x * y;}, abc); })
+    //    .then([] (auto in) { std::cout << in(50) << std::endl; return 0; });
     scheduler.run();
     return 0;
 }

@@ -1,6 +1,7 @@
 #include <cassert>
 #include <iostream>
 #include <queue>
+#include <stack>
 #include <functional>
 #include <memory>
 
@@ -77,24 +78,25 @@ auto curry(F f)
     return curry(make_function(f));
 }
 
-// CURRYING!
-//https://stackoverflow.com/questions/152005/how-can-currying-be-done-in-c/26768388#26768388
-//https://gist.github.com/ivan-cukic/6269914
-//https://www.reddit.com/r/cpp/comments/1kkkne/currying_in_c11/
-//https://github.com/LeszekSwirski/cpp-curry
 
 struct Scheduler {
-    std::queue<std::function<void()>> tasks;
-    void run();
-};
+    std::stack<std::function<void()>> tasks;
 
-void Scheduler::run() {
-    while (!tasks.empty()) {
-        auto& t = tasks.front();
-        t();
-        tasks.pop();
-    };
-}
+    template <typename F>
+    void add_task(F f) 
+    {
+        tasks.push(f);
+    }
+
+    void run()
+    {
+        while (!tasks.empty()) {
+            auto t = std::move(tasks.top());
+            tasks.pop();
+            t();
+        }
+    }
+};
 
 thread_local Scheduler scheduler;
 
@@ -105,35 +107,12 @@ struct STFData {
 };
 
 template <typename T>
-struct STF;
-
-template <typename F>
-static auto async(F f)
-{
-    auto out = STF<typename std::result_of_t<F()>>::empty();
-    scheduler.tasks.push([=] () mutable { out.fulfill(f()); });
-    return out;
-}
-
-template <typename T>
 struct STF {
     using Type = T;
     std::shared_ptr<STFData<T>> data;
 
     STF(): data(std::make_shared<STFData<T>>()) {}
 
-    static auto empty() 
-    {
-        return STF<T>();
-    }
-
-    static auto pure(T val) 
-    {
-        auto out = empty();
-        out.fulfill(std::move(val));
-        return out;
-    }
-    
     void fulfill(T val) 
     {
         assert(data->val == nullptr);
@@ -152,49 +131,37 @@ struct STF {
         }
     }
 
-    template <typename F>
-    auto then_impl(F f, auto future) 
-    {
-        add_trigger([=] (T& val) mutable
-            {
-                scheduler.tasks.push([=] () mutable
-                    {
-                        future.fulfill(f(val));   
-                    }
-                );
-            }
-        );
-    }
+
+    template <typename U>
+    auto ap(STF<U> val_fut);
 };
 
-template <typename F, typename T>
-auto fmap(F f, STF<T> val)
+template <typename T>
+auto ready(T val)
 {
-    auto f_curried = curry(f);
-    auto out = STF<std::result_of_t<decltype(f_curried)(T)>>::empty();
-    val.then_impl(f_curried, out);
+    STF<T> out;
+    out.fulfill(std::move(val));
     return out;
 }
 
 template <typename F, typename T>
-auto ap(STF<F> f_fut, STF<T> val_fut)
+auto bind(F f, STF<T> val_fut)
 {
-    auto out = STF<std::result_of_t<F(T)>>::empty();
-    f_fut.add_trigger([=] (F& f) mutable
+    using OutType = std::result_of_t<decltype(f)(T)>;
+    STF<OutType> future_of_future;
+    val_fut.add_trigger([=] (T& val) mutable
         {
-            val_fut.then_impl(f, out);
+            scheduler.add_task([=] () mutable
+                {
+                    future_of_future.fulfill(f(val));   
+                }
+            );
         }
     );
-    return out;
-}
-
-template <typename T>
-auto unwrap(STF<STF<T>> in)
-{
-    auto out = STF<T>::empty();
-    in.add_trigger([=] (STF<T>& inner) mutable
+    OutType out;
+    future_of_future.add_trigger([=] (OutType& inner) mutable
         {
-            inner.add_trigger([=] (T& val) mutable
+            inner.add_trigger([=] (typename OutType::Type& val) mutable
                 {
                     out.fulfill(val);
                 }
@@ -205,24 +172,69 @@ auto unwrap(STF<STF<T>> in)
 }
 
 template <typename F, typename T>
-auto bind(F f, STF<T> val_fut)
+auto fmap(F f, STF<T> val)
 {
-    auto out = STF<std::result_of_t<F(T)>>::empty();
-    val_fut.then_impl(f, out);
-    return unwrap(out);
+    auto f_curried = curry(f);
+    return bind([=] (const T& val) 
+        {
+            return ready(f_curried(val));
+        },
+        val
+    );
 }
 
+template <typename F>
+template <typename T>
+auto STF<F>::ap(STF<T> val_fut)
+{
+    return bind([=] (const F& f) 
+        {
+            return bind([=] (const T& val) {
+                    return ready(f(val)); 
+                }, 
+                val_fut
+            );
+        },
+        *this
+    );
+}
+
+auto add(int x, int y)
+{
+    return x + y;
+}
+
+auto fib(int index)
+{
+    if (index < 3) {
+        return ready(1);
+    }
+    return fmap(add, fib(index - 1)).ap(fib(index - 2));
+}
 
 int main() {
     auto print = [] (int v) { std::cout << v << std::endl; return 0; };
-    auto mult = [] (int x, int y) { return x * y; };
-    auto fut = async([] () { std::cout << "HI" << std::endl; return 11; });
-    fmap(print, fut);
-    // print <$> (mult <$> fut <*> STF 10)
-    fmap(print, ap(fmap(mult, fut), STF<int>::pure(10)));
-    auto react = [] (int x) { if (x < 5) { return STF<int>::pure(x); } else { return async([]() {return 20;}); } };
-    auto bound = bind(react, fut);
-    fmap(print, bound);
+    fmap(print, fib(25));
+
+    // auto mult = [] (int x, int y) { return x * y; };
+    // auto fut = fmap([] (int x) { std::cout << "HI" << std::endl; return x; }, ready(4));
+    // fmap(print, fut);
+    // // print <$> (mult <$> fut <*> STF 10)
+    // fmap(print, ap(fmap(mult, fut), ready<int>(10)));
+    // auto react = [] (int x) { 
+    //     if (x < 5) {
+    //         return ready(x); 
+    //     } else {
+    //         return ready(20);
+    //     } 
+    // };
+    // do
+    //     x <- fut
+    //     y <- if (x < 5) x else 20
+    //     z <- print y
+    //     return z
+    // auto bound = bind(react, fut);
+    // fmap(print, bound);
 
     scheduler.run();
     return 0;
